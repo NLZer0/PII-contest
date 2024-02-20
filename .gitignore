@@ -1,0 +1,5 @@
+__pycache__/
+catboost_info/
+data/
+old/
+wiki-news-300d-1M.vec
