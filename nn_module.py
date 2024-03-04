@@ -4,6 +4,8 @@ from importlib import reload
 
 import torch 
 from torch import nn 
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
 from tqdm.auto import tqdm 
 from sklearn.metrics import balanced_accuracy_score, f1_score, confusion_matrix, roc_auc_score
 
@@ -20,7 +22,7 @@ def log_sum_exp(vec, is_matrix=True):
         return max_scores + torch.log(torch.sum(torch.exp(vec - max_scores.expand(ncl,ncl).T), dim=1))
     else:
         max_scores = torch.max(vec)
-        return max_scores + torch.log(torch.sum(torch.exp(vec - max_scores.expand(ncl).T)))
+        return max_scores + torch.log(torch.sum(torch.exp(vec - max_scores.expand(1, ncl))))
 
 
 class BiLSTM_CRF(nn.Module):
@@ -67,7 +69,7 @@ class BiLSTM_CRF(nn.Module):
         return out
 
 
-    def _viterbi_decode(self, feats, device):
+    def _viterbi_decode(self, feats):
         backpointers = []
 
         # Initialize the viterbi variables in log space
@@ -75,24 +77,22 @@ class BiLSTM_CRF(nn.Module):
         init_vvars[0][self.tag_to_ix[self.START_TAG]] = 0
 
         # forward_var at step i holds the viterbi variables for step i-1
-        forward_var = init_vvars.to(device)
+        forward_var = init_vvars
         for feat in feats:
             bptrs_t = []  # holds the backpointers for this step
             viterbivars_t = []  # holds the viterbi variables for this step
 
-            for next_tag in range(self.tagset_size):
-                # next_tag_var[i] holds the viterbi variable for tag i at the
-                # previous step, plus the score of transitioning
-                # from tag i to next_tag.
-                # We don't include the emission scores here because the max
-                # does not depend on them (we add them in below)
-                next_tag_var = forward_var + self.transitions[next_tag]
-                best_tag_id = argmax(next_tag_var)
-                bptrs_t.append(best_tag_id)
-                viterbivars_t.append(next_tag_var[0][best_tag_id].view(1))
+            # next_tag_var = self.transitions + forward_var
+            # best_tag_id = torch.argmax(next_tag_var, dim=1)
+            # viterbivars_t = torch.max(next_tag_var, dim=1).values  
+
+            next_tag_var = self.transitions + forward_var
+            bptrs_t = torch.argmax(next_tag_var, dim=1)
+            viterbivars_t = torch.max(next_tag_var, dim=1).values
+
             # Now add in the emission scores, and assign forward_var to the set
             # of viterbi variables we just computed
-            forward_var = (torch.cat(viterbivars_t) + feat).view(1, -1)
+            forward_var = (viterbivars_t + feat).view(1, -1)
             backpointers.append(bptrs_t)
 
         # Transition to STOP_TAG
@@ -109,7 +109,7 @@ class BiLSTM_CRF(nn.Module):
         start = best_path.pop()
         assert start == self.tag_to_ix[self.START_TAG]  # Sanity check
         best_path.reverse()
-        return path_score, best_path
+        return path_score, torch.LongTensor(best_path)
     
 
     def neg_log_likelihood(self, sentence, tags, device):
@@ -153,8 +153,8 @@ class BiLSTM_CRF(nn.Module):
     
 
     def forward(self, batch, device):   
-        lstm_feats = self._get_lstm_features(batch)
-        score, tag_seq = self._viterbi_decode(lstm_feats, device)
+        lstm_feats = self._get_lstm_features(batch.to(device)).cpu()
+        score, tag_seq = self._viterbi_decode(lstm_feats)
 
         return score, tag_seq
     
@@ -194,14 +194,16 @@ class BiLSTM_CRF(nn.Module):
                     
                     test_predict = torch.FloatTensor(test_predict)
                     train_real = torch.cat(train_Y)
-    
-                    test_predict = []
-                    for batch_X in valid_X:
-                        score, predict = self.forward(batch_X.to(device), device)
-                        test_predict += predict
-                    
-                    test_predict = torch.FloatTensor(test_predict)
-                    test_real = torch.cat(valid_Y)
+
+
+                    with torch.no_grad():
+                        test_predict = []
+                        for batch_X in valid_X:
+                            score, predict = self.forward(batch_X.to(device), device)
+                            test_predict += predict
+                        
+                        test_predict = torch.FloatTensor(test_predict)
+                        test_real = torch.cat(valid_Y)
 
                     # train_predict, train_real = train_predict[train_predict != 0], train_real[train_predict != 0]
                     # test_predict, test_real = test_predict[test_predict != 0], test_real[test_predict != 0]
@@ -218,6 +220,7 @@ class BiLSTM_CRF(nn.Module):
                     r_metric_valid = TP / (TP + FN)
                     
                     print(f'Iter: {ep}, Loss: {eploss/len(train_X):.3f} Train precision {p_metric_train:.3f}, Train recall: {r_metric_train:.3f}, Valid precision: {p_metric_valid:.3f}, Valid recall: {r_metric_valid:.3f}')
+
                     # print(f'Iter: {ep}, Loss: {eploss/len(train_X):.3f} Train BA: {balanced_accuracy_score(train_real, train_predict):.3f}, Train F1: {f1_score(train_real, train_predict, average="micro"):.3f}, Valid BA: {balanced_accuracy_score(test_real, test_predict):.3f}, Valid F1: {f1_score(test_real, test_predict, average="micro"):.3f}')
                         
                 # printbool = ep % (nepochs//10) == 0 if nepochs > 10 else True
