@@ -2,161 +2,239 @@
 import time
 from importlib import reload
 
-import torch 
+import numpy as np
 from torch import nn 
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-
+# from crfseg import CRF
 from tqdm.auto import tqdm 
-from sklearn.metrics import balanced_accuracy_score, f1_score, confusion_matrix, roc_auc_score
 
-def argmax(vec):
-    # return the argmax as a python int
-    _, idx = torch.max(vec, 1)
-    return idx.item()
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-def log_sum_exp(vec, is_matrix=True):
-    ncl = vec.shape[1]
-    
-    if is_matrix:
-        max_scores = torch.max(vec, dim=1).values
-        return max_scores + torch.log(torch.sum(torch.exp(vec - max_scores.expand(ncl,ncl).T), dim=1))
-    else:
-        max_scores = torch.max(vec)
-        return max_scores + torch.log(torch.sum(torch.exp(vec - max_scores.expand(1, ncl))))
+
+def tqdm_if(obj, condition):
+    return tqdm(obj) if condition else obj
+
+
+class CRF(nn.Module):
+    """
+    Class for learning and inference in conditional random field model using mean field approximation
+    and convolutional approximation in pairwise potentials term.
+
+    Parameters
+    ----------
+    n_spatial_dims : int
+        Number of spatial dimensions of input tensors.
+    filter_size : int or sequence of ints
+        Size of the gaussian filters in message passing.
+        If it is a sequence its length must be equal to ``n_spatial_dims``.
+    n_iter : int
+        Number of iterations in mean field approximation.
+    requires_grad : bool
+        Whether or not to train CRF's parameters.
+    returns : str
+        Can be 'logits', 'proba', 'log-proba'.
+    smoothness_weight : float
+        Initial weight of smoothness kernel.
+    smoothness_theta : float or sequence of floats
+        Initial bandwidths for each spatial feature in the gaussian smoothness kernel.
+        If it is a sequence its length must be equal to ``n_spatial_dims``.
+    """
+
+    def __init__(self, n_spatial_dims, filter_size=11, n_iter=5, requires_grad=True,
+                 returns='logits', smoothness_weight=1, smoothness_theta=1):
+        super().__init__()
+        self.n_spatial_dims = n_spatial_dims
+        self.n_iter = n_iter
+        self.filter_size = np.broadcast_to(filter_size, n_spatial_dims)
+        self.returns = returns
+        self.requires_grad = requires_grad
+
+        self._set_param('smoothness_weight', smoothness_weight)
+        self._set_param('inv_smoothness_theta', 1 / np.broadcast_to(smoothness_theta, n_spatial_dims))
+
+    def _set_param(self, name, init_value):
+        setattr(self, name, nn.Parameter(torch.tensor(init_value, dtype=torch.float, requires_grad=self.requires_grad)))
+
+    def forward(self, x, spatial_spacings=None, display_tqdm=False):
+        """
+        Parameters
+        ----------
+        x : torch.tensor
+            Tensor of shape ``(batch_size, n_classes, *spatial)`` with negative unary potentials, e.g. the CNN's output.
+        spatial_spacings : array of floats or None
+            Array of shape ``(batch_size, len(spatial))`` with spatial spacings of tensors in batch ``x``.
+            None is equivalent to all ones. Used to adapt spatial gaussian filters to different inputs' resolutions.
+        display_tqdm : bool
+            Whether to display the iterations using tqdm-bar.
+
+        Returns
+        -------
+        output : torch.tensor
+            Tensor of shape ``(batch_size, n_classes, *spatial)``
+            with logits or (log-)probabilities of assignment to each class.
+        """
+        batch_size, n_classes, *spatial = x.shape
+        assert len(spatial) == self.n_spatial_dims
+
+        # binary segmentation case
+        if n_classes == 1:
+            x = torch.cat([x, torch.zeros(x.shape).to(x)], dim=1)
+
+        if spatial_spacings is None:
+            spatial_spacings = np.ones((batch_size, self.n_spatial_dims))
+
+        negative_unary = x.clone()
+
+        for i in tqdm_if(range(self.n_iter), display_tqdm):
+            # normalizing
+            x = F.softmax(x, dim=1)
+
+            # message passing
+            x = self.smoothness_weight * self._smoothing_filter(x, spatial_spacings)
+
+            # compatibility transform
+            x = self._compatibility_transform(x)
+
+            # adding unary potentials
+            x = negative_unary - x
+
+        if self.returns == 'logits':
+            output = x
+        elif self.returns == 'proba':
+            output = F.softmax(x, dim=1)
+        elif self.returns == 'log-proba':
+            output = F.log_softmax(x, dim=1)
+        else:
+            raise ValueError("Attribute ``returns`` must be 'logits', 'proba' or 'log-proba'.")
+
+        if n_classes == 1:
+            output = output[:, 0] - output[:, 1] if self.returns == 'logits' else output[:, 0]
+            output.unsqueeze_(1)
+
+        return output
+
+    def _smoothing_filter(self, x, spatial_spacings):
+        """
+        Parameters
+        ----------
+        x : torch.tensor
+            Tensor of shape ``(batch_size, n_classes, *spatial)`` with negative unary potentials, e.g. logits.
+        spatial_spacings : torch.tensor or None
+            Tensor of shape ``(batch_size, len(spatial))`` with spatial spacings of tensors in batch ``x``.
+
+        Returns
+        -------
+        output : torch.tensor
+            Tensor of shape ``(batch_size, n_classes, *spatial)``.
+        """
+        return torch.stack([self._gaussian_filter(x[i], self.inv_smoothness_theta, spatial_spacings[i], self.filter_size)
+                            for i in range(x.shape[0])])
+
+    @staticmethod
+    def _gaussian_filter(x, inv_theta, spatial_spacing, filter_size):
+        """
+        Parameters
+        ----------
+        x : torch.tensor
+            Tensor of shape ``(n, *spatial)``.
+        inv_theta : torch.tensor
+            Tensor of shape ``(len(spatial),)``
+        spatial_spacing : sequence of len(spatial) floats
+        filter_size : sequence of len(spatial) ints
+
+        Returns
+        -------
+        output : torch.tensor
+            Tensor of shape ``(n, *spatial)``.
+        """
+        for i, dim in enumerate(range(1, x.ndim)):
+            # reshape to (-1, 1, x.shape[dim])
+            x = x.transpose(dim, -1)
+            shape_before_flatten = x.shape[:-1]
+            x = x.flatten(0, -2).unsqueeze(1)
+
+            # 1d gaussian filtering
+            kernel = CRF.create_gaussian_kernel1d(inv_theta[i], spatial_spacing[i], filter_size[i]).view(1, 1, -1).to(x)
+            x = F.conv1d(x, kernel, padding=(filter_size[i] // 2,))
+
+            # reshape back to (n, *spatial)
+            x = x.squeeze(1).view(*shape_before_flatten, x.shape[-1]).transpose(-1, dim)
+
+        return x
+
+    @staticmethod
+    def create_gaussian_kernel1d(inverse_theta, spacing, filter_size):
+        """
+        Parameters
+        ----------
+        inverse_theta : torch.tensor
+            Tensor of shape ``(,)``
+        spacing : float
+        filter_size : int
+
+        Returns
+        -------
+        kernel : torch.tensor
+            Tensor of shape ``(filter_size,)``.
+        """
+        distances = spacing * torch.arange(-(filter_size // 2), filter_size // 2 + 1).to(inverse_theta)
+        kernel = torch.exp(-(distances * inverse_theta) ** 2 / 2)
+        zero_center = torch.ones(filter_size).to(kernel)
+        zero_center[filter_size // 2] = 0
+        return kernel * zero_center
+
+    def _compatibility_transform(self, x):
+        """
+        Parameters
+        ----------
+        x : torch.Tensor of shape ``(batch_size, n_classes, *spatial)``.
+
+        Returns
+        -------
+        output : torch.tensor of shape ``(batch_size, n_classes, *spatial)``.
+        """
+        labels = torch.arange(x.shape[1])
+        compatibility_matrix = self._compatibility_function(labels, labels.unsqueeze(1)).to(x)
+        return torch.einsum('ij..., jk -> ik...', x, compatibility_matrix)
+
+    @staticmethod
+    def _compatibility_function(label1, label2):
+        """
+        Input tensors must be broadcastable.
+
+        Parameters
+        ----------
+        label1 : torch.Tensor
+        label2 : torch.Tensor
+
+        Returns
+        -------
+        compatibility : torch.Tensor
+        """
+        return -(label1 == label2).float()
+
 
 
 class BiLSTM_CRF(nn.Module):
-    def __init__(self, embedding_dim, hidden_size, nclasses, label2num, device='cpu') -> None:
+    def __init__(self, embedding_dim, hidden_size, nclasses, device='cpu') -> None:
         super().__init__()
 
         # self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embedding_dim).to(device)
         self.lstm_model = nn.LSTM(embedding_dim, hidden_size//2, bidirectional=True).to(device)
-        self.ffwd_lay = nn.Linear(hidden_size, nclasses+2).to(device)
-        self.softmax = nn.Softmax(dim=1).to(device)
+        self.ffwd_lay = nn.Linear(hidden_size, nclasses).to(device)
+        self.crf = CRF(n_spatial_dims=1, returns='proba')
 
         self.optim = torch.optim.Adam(self.parameters(), lr=1e-2)
+        self.criterion = nn.CrossEntropyLoss()
         
         self.loss_history = []
-        self.hidden_size = hidden_size
 
-        self.tag_to_ix = label2num.copy()
-
-        self.START_TAG = '<START>'
-        self.STOP_TAG = '<STOP>'
-        self.tag_to_ix[self.START_TAG] = max(label2num.values()) + 1
-        self.tag_to_ix[self.STOP_TAG] = max(label2num.values()) + 2
-
-        self.tagset_size = nclasses+2
-
-        # Matrix of transition parameters.  Entry i,j is the score of
-        # transitioning *to* i *from* j.
-        self.transitions = nn.Parameter(
-            torch.randn(self.tagset_size, self.tagset_size))
-        
-        self.transitions.data[self.tag_to_ix[self.START_TAG], :] = -10000
-        self.transitions.data[:, self.tag_to_ix[self.STOP_TAG]] = -10000
-
-        self.hidden = self.init_hidden()
-
-    def init_hidden(self):
-        return (torch.randn(2, 1, self.hidden_size // 2),
-                torch.randn(2, 1, self.hidden_size // 2))
-    
-
-    def _get_lstm_features(self, batch):
-        out = self.lstm_model(batch)[0] # L x hidden_size
-        out = self.ffwd_lay(out) # L x nclasses
-        return out
-
-
-    def _viterbi_decode(self, feats):
-        backpointers = []
-
-        # Initialize the viterbi variables in log space
-        init_vvars = torch.full((1, self.tagset_size), -10000.)
-        init_vvars[0][self.tag_to_ix[self.START_TAG]] = 0
-
-        # forward_var at step i holds the viterbi variables for step i-1
-        forward_var = init_vvars
-        for feat in feats:
-            bptrs_t = []  # holds the backpointers for this step
-            viterbivars_t = []  # holds the viterbi variables for this step
-
-            # next_tag_var = self.transitions + forward_var
-            # best_tag_id = torch.argmax(next_tag_var, dim=1)
-            # viterbivars_t = torch.max(next_tag_var, dim=1).values  
-
-            next_tag_var = self.transitions + forward_var
-            bptrs_t = torch.argmax(next_tag_var, dim=1)
-            viterbivars_t = torch.max(next_tag_var, dim=1).values
-
-            # Now add in the emission scores, and assign forward_var to the set
-            # of viterbi variables we just computed
-            forward_var = (viterbivars_t + feat).view(1, -1)
-            backpointers.append(bptrs_t)
-
-        # Transition to STOP_TAG
-        terminal_var = forward_var + self.transitions[self.tag_to_ix[self.STOP_TAG]]
-        best_tag_id = argmax(terminal_var)
-        path_score = terminal_var[0][best_tag_id]
-
-        # Follow the back pointers to decode the best path.
-        best_path = [best_tag_id]
-        for bptrs_t in reversed(backpointers):
-            best_tag_id = bptrs_t[best_tag_id]
-            best_path.append(best_tag_id)
-        # Pop off the start tag (we dont want to return that to the caller)
-        start = best_path.pop()
-        assert start == self.tag_to_ix[self.START_TAG]  # Sanity check
-        best_path.reverse()
-        return path_score, torch.LongTensor(best_path)
-    
-
-    def neg_log_likelihood(self, sentence, tags, device):
-        feats = self._get_lstm_features(sentence.to(device))
-        forward_score = self._forward_alg(feats, device)
-        gold_score = self._score_sentence(feats, tags, device)
-
-        return forward_score - gold_score
-    
-
-    def _score_sentence(self, feats, tags, device):
-        # Gives the score of a provided tag sequence
-        score = torch.zeros(1, device=device)
-        tags = torch.cat([torch.tensor([self.tag_to_ix[self.START_TAG]], dtype=torch.long), tags]).to(device)
-        
-        # for i, feat in enumerate(feats):
-            # score += self.transitions[tags[i + 1], tags[i]] + feat[tags[i + 1]]
-        # score += self.transitions[self.tag_to_ix[self.STOP_TAG], tags[-1]]
-
-        score = torch.sum(self.transitions[tags[1:], tags[:-1]] + feats[range(len(feats)), tags[1:]]) + self.transitions[self.tag_to_ix[self.STOP_TAG], tags[-1]]
-        return score
-
-
-    def _forward_alg(self, feats, device):
-        # Do the forward algorithm to compute the partition function
-        init_alphas = torch.full((1, self.tagset_size), -10000.).to(device)
-        # START_TAG has all of the score.
-        init_alphas[0][self.tag_to_ix[self.START_TAG]] = 0.
-
-        # Wrap in a variable so that we will get automatic backprop
-        forward_var = init_alphas
-
-        # Iterate through the sentence
-        ncl = self.transitions.shape[0]
-        for feat in feats:
-            forward_var = log_sum_exp(forward_var + self.transitions + feat.expand((ncl,ncl)).T).view(1, -1)
-
-        terminal_var = forward_var + self.transitions[self.tag_to_ix[self.STOP_TAG]]
-        alpha = log_sum_exp(terminal_var, is_matrix=False)
-        return alpha
-    
-
-    def forward(self, batch, device):   
-        lstm_feats = self._get_lstm_features(batch.to(device)).cpu()
-        score, tag_seq = self._viterbi_decode(lstm_feats)
-
-        return score, tag_seq
+    def forward(self, batch):   
+        out, _ = self.lstm_model(batch)
+        out = self.ffwd_lay(out)
+        out = self.crf.forward(out.T.unsqueeze(0))
+        return out[0].T
     
 
     def fit(self, train_X, train_Y, valid_X, valid_Y, nepochs, lr, device):
@@ -175,9 +253,9 @@ class BiLSTM_CRF(nn.Module):
 
             for i, (batch_X, batch_Y) in tqdm(enumerate(zip(train_X, train_Y))):
                 self.zero_grad()
-
-                loss = self.neg_log_likelihood(batch_X, batch_Y, device)
-            
+                
+                predict = self.forward(batch_X.to(device))
+                loss = self.criterion(predict, batch_Y.to(device))
                 loss.backward()
                 self.optim.step()
 
@@ -187,42 +265,16 @@ class BiLSTM_CRF(nn.Module):
             printbool = ep % (nepochs//10) == 0 if nepochs > 10 else True
             if printbool:
                 with torch.no_grad():
-                    train_predict = []
-                    for batch_X in train_X:
-                        score, predict = self.forward(batch_X.to(device), device)
-                        train_predict += predict
-                    
-                    test_predict = torch.FloatTensor(test_predict)
-                    train_real = torch.cat(train_Y)
-
-
-                    with torch.no_grad():
-                        test_predict = []
-                        for batch_X in valid_X:
-                            score, predict = self.forward(batch_X.to(device), device)
-                            test_predict += predict
-                        
-                        test_predict = torch.FloatTensor(test_predict)
-                        test_real = torch.cat(valid_Y)
-
-                    # train_predict, train_real = train_predict[train_predict != 0], train_real[train_predict != 0]
-                    # test_predict, test_real = test_predict[test_predict != 0], test_real[test_predict != 0]
-                    TP = ((train_predict == train_real) & (train_predict != 0)).sum()
-                    FP = ((train_predict != train_real) & (train_predict != 0)).sum()
-                    FN = ((train_predict != train_real) & (train_predict == 0)).sum()
-                    p_metric_train = TP / (TP + FP)
-                    r_metric_train = TP / (TP + FN)
-
-                    TP = ((test_predict == test_real) & (test_predict != 0)).sum()
-                    FP = ((test_predict != test_real) & (test_predict != 0)).sum()
-                    FN = ((test_predict != test_real) & (test_predict == 0)).sum()
+                    TP, TN, FP, FN = 0., 0., 0., 0.
+                    for batch_X, batch_Y in tqdm(zip(valid_X, valid_Y)):
+                        predict = torch.argmax(self.forward(batch_X.to(device)), dim=1).cpu()
+                        TP += ((predict == batch_Y) & (predict != 0)).sum()
+                        TN += ((predict == batch_Y) & (predict == 0)).sum()
+                        FP += ((predict != batch_Y) & (predict != 0)).sum()
+                        FN += ((predict != batch_Y) & (predict == 0)).sum()
                     p_metric_valid = TP / (TP + FP)
                     r_metric_valid = TP / (TP + FN)
-                    
-                    print(f'Iter: {ep}, Loss: {eploss/len(train_X):.3f} Train precision {p_metric_train:.3f}, Train recall: {r_metric_train:.3f}, Valid precision: {p_metric_valid:.3f}, Valid recall: {r_metric_valid:.3f}')
 
-                    # print(f'Iter: {ep}, Loss: {eploss/len(train_X):.3f} Train BA: {balanced_accuracy_score(train_real, train_predict):.3f}, Train F1: {f1_score(train_real, train_predict, average="micro"):.3f}, Valid BA: {balanced_accuracy_score(test_real, test_predict):.3f}, Valid F1: {f1_score(test_real, test_predict, average="micro"):.3f}')
-                        
-                # printbool = ep % (nepochs//10) == 0 if nepochs > 10 else True
-                # if printbool:
-                #     print(f'Train loss: {eploss/len(train_X):.3f}')
+                    print(f'Loss: {eploss/len(train_X):.3f}, Valid precision: {p_metric_valid:.3f}, Valid recall: {r_metric_valid:.3f}')
+                    
+ 
