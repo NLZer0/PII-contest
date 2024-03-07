@@ -1,4 +1,5 @@
 # model class 
+import os
 import time
 from importlib import reload
 
@@ -6,10 +7,12 @@ import numpy as np
 from torch import nn 
 # from crfseg import CRF
 from tqdm.auto import tqdm 
+from sklearn.metrics import f1_score
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import AutoModel
 
 
 def tqdm_if(obj, condition):
@@ -215,29 +218,33 @@ class CRF(nn.Module):
         return -(label1 == label2).float()
 
 
-
 class BiLSTM_CRF(nn.Module):
-    def __init__(self, embedding_dim, hidden_size, nclasses, device='cpu') -> None:
+    def __init__(self, embedding_size, hidden_size, nclasses, pretrain_longformer='saved_models/longformer', device='cpu') -> None:
         super().__init__()
 
-        # self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embedding_dim).to(device)
-        self.lstm_model = nn.LSTM(embedding_dim, hidden_size//2, bidirectional=True).to(device)
-        self.ffwd_lay = nn.Linear(hidden_size, nclasses).to(device)
-        self.crf = CRF(n_spatial_dims=1, returns='proba')
+        self.longformer = AutoModel.from_pretrained(pretrain_longformer)
+        self.lstm_model = nn.LSTM(embedding_size, hidden_size//2, bidirectional=True).to(device)
+        self.out_lay = nn.Linear(hidden_size, nclasses).to(device)
+        # self.crf = CRF(n_spatial_dims=1, returns='proba')
 
         self.optim = torch.optim.Adam(self.parameters(), lr=1e-2)
         self.criterion = nn.CrossEntropyLoss()
         
         self.loss_history = []
 
-    def forward(self, batch):   
-        out, _ = self.lstm_model(batch)
-        out = self.ffwd_lay(out)
-        out = self.crf.forward(out.T.unsqueeze(0))
-        return out[0].T
+
+    def forward(self, input, att_mask):  
+        out = self.longformer(
+            input_ids=input,
+            attention_mask=att_mask,
+        ).last_hidden_state
+        out, _ = self.lstm_model(out)
+        out = self.out_lay(out)
+        # out = self.crf.forward(out.T.unsqueeze(0))
+        return out
     
 
-    def fit(self, train_X, train_Y, valid_X, valid_Y, nepochs, lr, device):
+    def fit(self, train, nepochs, lr, device):
         self.train()
         self.to(device)
 
@@ -246,35 +253,30 @@ class BiLSTM_CRF(nn.Module):
         
         for ep in tqdm(range(nepochs)):
             eploss = 0
-        
-            if ep % 20 == 0:
-                for g in self.optim.param_groups:
-                    g['lr'] = lr/2  
 
-            for i, (batch_X, batch_Y) in tqdm(enumerate(zip(train_X, train_Y))):
+            for batch in tqdm(train):
                 self.zero_grad()
                 
-                predict = self.forward(batch_X.to(device))
-                loss = self.criterion(predict, batch_Y.to(device))
+                predict = self.forward(batch['input_ids'].to(device), att_mask=batch['attention_mask'].to(device))
+                loss = self.criterion(predict.squeeze(), batch['labels'].to(device))
                 loss.backward()
                 self.optim.step()
 
                 eploss += loss.item()
                 self.loss_history.append(loss.item())
 
-            printbool = ep % (nepochs//10) == 0 if nepochs > 10 else True
-            if printbool:
-                with torch.no_grad():
-                    TP, TN, FP, FN = 0., 0., 0., 0.
-                    for batch_X, batch_Y in tqdm(zip(valid_X, valid_Y)):
-                        predict = torch.argmax(self.forward(batch_X.to(device)), dim=1).cpu()
-                        TP += ((predict == batch_Y) & (predict != 0)).sum()
-                        TN += ((predict == batch_Y) & (predict == 0)).sum()
-                        FP += ((predict != batch_Y) & (predict != 0)).sum()
-                        FN += ((predict != batch_Y) & (predict == 0)).sum()
-                    p_metric_valid = TP / (TP + FP)
-                    r_metric_valid = TP / (TP + FN)
+            # if (ep+1) % 2 == 0:
+            #     with torch.no_grad():
+            #         predict_valid = []
+            #         real = []
+            #         for batch_X, batch_Y in zip(valid_X, valid_Y):
+            #             predict = torch.argmax(self.forward(batch_X.to(device)), dim=1).cpu()
+            #             mask = (predict != 0) | (batch_Y != 0)
 
-                    print(f'Loss: {eploss/len(train_X):.3f}, Valid precision: {p_metric_valid:.3f}, Valid recall: {r_metric_valid:.3f}')
-                    
- 
+            #             predict_valid.append(predict[mask])
+            #             real.append(batch_Y[mask])
+
+            #         predict_valid = torch.cat(predict_valid)
+            #         real = torch.cat(real)
+
+            #         print(f'Fscore micro {f1_score(real, predict_valid, average="micro"):.3f}')
